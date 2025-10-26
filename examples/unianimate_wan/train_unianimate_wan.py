@@ -18,6 +18,66 @@ import  torch.nn  as nn
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
+import time
+from datetime import timedelta
+import lightning as pl
+import torch
+
+class TrainStatsCallback(pl.Callback):
+    def __init__(self):
+        super().__init__()
+        self.fit_start = None
+        self.epoch_start = None
+        self.epoch_durations = []
+        self.gpu_count = 0
+        self.gpu_names = []
+
+    def on_fit_start(self, trainer, pl_module):
+        self.fit_start = time.time()
+        self.gpu_count = getattr(trainer, "world_size", torch.cuda.device_count())
+        if torch.cuda.is_available():
+            names = []
+            for i in range(torch.cuda.device_count()):
+                try:
+                    names.append(torch.cuda.get_device_name(i))
+                except Exception:
+                    pass
+            seen = set()
+            self.gpu_names = [n for n in names if not (n in seen or seen.add(n))]
+        else:
+            self.gpu_names = []
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        self.epoch_start = time.time()
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        if self.epoch_start is not None:
+            self.epoch_durations.append(time.time() - self.epoch_start)
+            self.epoch_start = None
+
+    def on_fit_end(self, trainer, pl_module):
+        if hasattr(trainer, "is_global_zero") and not trainer.is_global_zero:
+            return
+        total_time_sec = max(0.0, time.time() - (self.fit_start or time.time()))
+        epochs_done = len(self.epoch_durations)
+        avg_epoch_sec = (sum(self.epoch_durations) / epochs_done) if epochs_done > 0 else 0.0
+
+        def fmt(secs: float) -> str:
+            return str(timedelta(seconds=int(round(secs))))
+
+        gpu_info = "CPU"
+        if self.gpu_count and self.gpu_names:
+            gpu_info = f"{self.gpu_count} x {', '.join(self.gpu_names)}"
+        elif self.gpu_count:
+            gpu_info = f"{self.gpu_count} x GPU"
+
+        print("========== Training Summary ==========")
+        print(f"GPUs         : {gpu_info}")
+        print(f"Epochs       : {epochs_done}")
+        print(f"Avg/Epoch    : {fmt(avg_epoch_sec)} ({avg_epoch_sec:.2f}s)")
+        print(f"Total Time   : {fmt(total_time_sec)} ({total_time_sec:.2f}s)")
+        print("======================================")
+
 
 class TextVideoDataset(torch.utils.data.Dataset):
     def __init__(self, base_path, metadata_path, max_num_frames=81, frame_interval=1, num_frames=81, height=480, width=832, is_i2v=False):
@@ -409,8 +469,12 @@ class TextVideoDataset_onestage(torch.utils.data.Dataset):
     
 
     def __len__(self):
-        
-        return len(self.video_list)
+        # 确保分布式下每个 rank 都有样本；若 steps_per_epoch 提供，则优先使用它
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if isinstance(self.steps_per_epoch, int) and self.steps_per_epoch > 0:
+            return max(self.steps_per_epoch, world_size)
+        return max(len(self.video_list), world_size)
+
  
 
 
@@ -874,6 +938,13 @@ def parse_args():
         default=None,
         help="SwanLab mode (cloud or local).",
     )
+    
+    # Checkpoint arguments
+    parser.add_argument("--save_every_n_train_steps", type=int, default=None, help="Save checkpoint every n training steps.")
+    parser.add_argument("--save_every_n_epochs", type=int, default=1, help="Save checkpoint every n epochs.")
+    parser.add_argument("--save_last", action="store_true", default=True, help="Whether to always save the last checkpoint.")
+    parser.add_argument("--checkpoint_dir", type=str, default=None, help="Directory to save checkpoints separately.")
+    
     args = parser.parse_args()
     return args
 
@@ -1066,17 +1137,47 @@ def train_onestage(args):
         logger = [swanlab_logger]
     else:
         logger = None
+        
+    # 动态创建 ModelCheckpoint
+    from lightning.pytorch.callbacks import ModelCheckpoint, TQDMProgressBar
+    ckpt_dir = args.checkpoint_dir or os.path.join(args.output_path, "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    if args.save_every_n_train_steps is not None and args.save_every_n_train_steps > 0:
+        ckpt_cb = ModelCheckpoint(
+            dirpath=ckpt_dir,
+            filename="step-{step:06d}",
+            save_top_k=-1,
+            every_n_train_steps=args.save_every_n_train_steps
+        )
+    else:
+        ckpt_cb = ModelCheckpoint(
+            dirpath=ckpt_dir,
+            filename="epoch-{epoch:02d}-step-{step:06d}",
+            save_top_k=-1,
+            every_n_epochs=max(args.save_every_n_epochs, 1),
+            save_on_train_epoch_end=True,
+            save_last=args.save_last
+        )
+
+    # 统计回调
+    stats_cb = TrainStatsCallback()
+    # 每个 epoch 只更新一次进度条（len(dataloader) 步）
+    pb_cb = TQDMProgressBar(refresh_rate=max(1, args.steps_per_epoch // 10))
+
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         accelerator="gpu",
         devices="auto",
-        precision="bf16",
+        precision="bf16-mixed",           # 建议使用 bf16-mixed
         strategy=args.training_strategy,
         default_root_dir=args.output_path,
         accumulate_grad_batches=args.accumulate_grad_batches,
-        callbacks=[pl.pytorch.callbacks.ModelCheckpoint(save_top_k=-1, every_n_train_steps=100)], # save checkpoints every_n_train_steps 
+        enable_progress_bar=True,         # 开启进度条
+        log_every_n_steps=max(1, len(dataloader)),  # 记录频率与 epoch 对齐（减少无用行）
+        callbacks=[ckpt_cb, stats_cb, pb_cb],       # 加入统计与进度条回调
         logger=logger,
     )
+
     trainer.fit(model, dataloader)
 
 if __name__ == '__main__':
